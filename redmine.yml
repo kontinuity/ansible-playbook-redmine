@@ -1,0 +1,106 @@
+---
+- hosts: redmine
+  sudo: yes
+  vars_files:
+    - vars.yml
+  tasks:
+    - name: add domain to hosts file for fast resolution
+      action: template src=templates/hosts.j2 dest=/etc/hosts
+    - name: ensure apt cache is up to date
+      action: apt update_cache=yes
+    - name: ensure app apt dependencies are installed
+      action: apt pkg=$item
+      with_items:
+        - build-essential
+        - checkinstall
+        - curl
+        - logrotate
+        - mysql-client
+        - mysql-server
+        - openssh-server
+        - postfix
+        - redis-server
+        - subversion
+        - python-mysqldb # Required for ansible mysql module to work, see: http://ansible.cc/docs/modules.html#mysql-user
+
+- hosts: redmine
+  sudo: yes
+  vars_files:
+    - vars.yml
+  tasks:
+    - name: ensure data directory owned by ubuntu
+      file: path=/data owner=ubuntu group=ubuntu state=directory
+
+- hosts: redmine
+  vars_files:
+    - vars.yml
+  tasks:
+    - name: Checkout 2.4 branch of redmine
+      subversion: repo=http://svn.redmine.org/redmine/tags/2.4.0/ dest=/data/redmine-2.4 force=yes
+    - name: Creating pids folder
+      file: path=/data/redmine-2.4/tmp/pids owner=ubuntu group=ubuntu state=directory
+    - name: Copy unicorn file
+      template: src=templates/unicorn.rb.j2 dest=/data/redmine-2.4/config/unicorn.rb owner=ubuntu
+- hosts: redmine
+  sudo: yes
+  vars_files:
+    - vars.yml
+  tasks:
+    - name: Create redmine DB
+      mysql_db: name=redmine state=present
+    - name: Create redmine user
+      mysql_user: name=redmine password=$database_password priv=redmine.*:ALL state=present
+    - name: Add database config
+      template: src=templates/database.yml.j2 dest=/data/redmine-2.4/config/database.yml owner=ubuntu mode=0600
+
+- hosts: redmine
+  vars_files:
+    - vars.yml
+  tasks:
+    - name: Adding unicorn dependency
+      template: src=templates/Gemfile.local.j2 dest=/data/redmine-2.4/Gemfile.local owner=ubuntu
+    - name: Update redmine bundle
+      command: bundle install --without development test rmagick chdir=/data/redmine-2.4
+    - name: Session store secret generation
+      command: rake generate_secret_token chdir=/data/redmine-2.4
+    - name: Migrate database
+      shell: RAILS_ENV=production rake db:migrate chdir=/data/redmine-2.4
+
+- hosts: redmine
+  sudo: yes
+  vars_files:
+    - vars.yml
+  tasks:
+    - name: install unicorn globally
+      gem: name=unicorn state=latest
+    - name: ensure startup script
+      template: src=templates/redmine.initd.j2 dest=/etc/init.d/redmine
+    - name: ensure startup script file mode
+      file: path=/etc/init.d/redmine mode=0755
+    - name: make redmine start on boot
+      command: update-rc.d redmine defaults 21
+    - name: start redmine
+      service: name=redmine state=restarted
+      ignore_errors: yes
+
+# 7. Nginx
+- hosts: redmine
+  sudo: yes
+  vars_files:
+    - vars.yml
+  tasks:
+    - name: ensure package nginx is present
+      apt: state=present pkg=nginx
+    - name: ensure redmine Nginx site is available
+      action: template src=templates/nginx.conf.j2 dest=/etc/nginx/sites-available/redmine mode=0755
+    - name: ensure default Nginx site is not enabled
+      file: state=absent path=/etc/nginx/sites-enabled/default
+    - name: ensure redmine Nginx site is enabled
+      file: state=link src=/etc/nginx/sites-available/redmine path=/etc/nginx/sites-enabled/redmine
+
+- hosts: redmine
+  sudo: yes
+  tasks:
+    - name: restart Nginx
+      service: name=nginx state=restarted
+      ignore_errors: yes
